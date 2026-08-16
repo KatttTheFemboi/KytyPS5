@@ -1,0 +1,124 @@
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+index 44b5503..0fa91a2 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+@@ -734,23 +734,42 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
+ 		    src_memory ? m_texture_cache.QueryRegion(src_vaddr, size) : TextureCache::RegionInfo {};
+ 		const auto dst_region =
+ 		    dst_memory ? m_texture_cache.QueryRegion(dst_vaddr, size) : TextureCache::RegionInfo {};
++		// CPU fast-path: both buffers are clean on the GPU side and the source has a direct
++		// CPU-accessible backing. This avoids allocating Vulkan buffers and scheduling a GPU
++		// copy command for what is essentially a plain memcpy visible only to the CPU.
++		// We gate on HasDirectBacking so that GPU-only source memory (e.g. garlic/onion
++		// allocations with no CPU mapping) falls through to the GPU buffer path below instead
++		// of crashing.
+ 		if (src_memory && dst_memory && !HasGpuDirtyBytes(src_vaddr, size) &&
+ 		    !HasGpuDirtyBytes(dst_vaddr, size) && !src_region.gpu_image_bytes &&
+-		    !dst_region.gpu_image_bytes) {
++		    !dst_region.gpu_image_bytes &&
++		    Libs::LibKernel::Memory::HasDirectBacking(src_vaddr, size)) {
+ 			if (dst_region.image_bytes) {
+ 				m_texture_cache.InvalidateMemory(dst_vaddr, size);
+ 			}
+ 			std::array<uint8_t, 64 * 1024> bytes;
++			bool fast_path_ok = true;
+ 			for (uint64_t offset = 0; offset < size;) {
+ 				const auto chunk = std::min<uint64_t>(size - offset, bytes.size());
+ 				if (!Libs::LibKernel::Memory::TryReadBacking(src_vaddr + offset, bytes.data(),
+ 				                                             chunk)) {
+-					EXIT("BufferCache: host DMA source has no direct backing\n");
++					// HasDirectBacking passed but TryReadBacking failed — this can only
++					// happen as a race (memory unmapped between the two calls). Log and
++					// fall through to the GPU buffer path rather than returning a
++					// partial result.
++					LOGF("BufferCache: DMA source backing vanished mid-copy at "
++					     "0x%016" PRIx64 "+0x%016" PRIx64 ", falling back to GPU path\n",
++					     src_vaddr, offset);
++					fast_path_ok = false;
++					break;
+ 				}
+ 				WriteHostMemory(dst_vaddr + offset, std::span {bytes}.first(chunk));
+ 				offset += chunk;
+ 			}
+-			return;
++			if (fast_path_ok) {
++				return;
++			}
++			// Fall through to GPU buffer path below.
+ 		}
+ 	}
+ 
+diff --git a/src/kernel/memory.cpp b/src/kernel/memory.cpp
+index ce84cd4..a384d97 100644
+--- a/src/kernel/memory.cpp
++++ b/src/kernel/memory.cpp
+@@ -867,6 +867,11 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
+ 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
+ }
+ 
++bool HasDirectBacking(uint64_t vaddr, uint64_t size) {
++	return g_guest_address_space != nullptr &&
++	       g_guest_address_space->HasDirectBacking(vaddr, size);
++}
++
+ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
+ 	EXIT_IF(g_virtual_ranges == nullptr);
+ 
+diff --git a/src/kernel/memory.h b/src/kernel/memory.h
+index 45017ba..96b55fb 100644
+--- a/src/kernel/memory.h
++++ b/src/kernel/memory.h
+@@ -109,6 +109,7 @@ void                   RegisterCallbacks(callback_func_t alloc_func, callback_fu
+ void                   SetFlexibleMemorySize(uint64_t size);
+ bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
+ bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
++bool                   HasDirectBacking(uint64_t vaddr, uint64_t size);
+ [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+ void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
+ void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+diff --git a/src/kernel/memoryAddressSpace.inc b/src/kernel/memoryAddressSpace.inc
+index 9ea25b0..7b6830c 100644
+--- a/src/kernel/memoryAddressSpace.inc
++++ b/src/kernel/memoryAddressSpace.inc
+@@ -188,6 +188,30 @@ public:
+ 		    });
+ 	}
+ 
++	// Check whether the entire [vaddr, vaddr+size) range has direct (CPU-accessible) physical
++	// backing, without transferring any data. Returns false if any sub-range is unmapped or its
++	// backing_offset falls outside the allocated backing store.
++	bool HasDirectBacking(uint64_t vaddr, uint64_t size) {
++		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
++			return false;
++		}
++		std::lock_guard lock(m_mutex);
++		const auto      end     = vaddr + size;
++		auto            current = vaddr;
++		while (current < end) {
++			MapEntry entry {};
++			if (!FindContainingUnlocked(current, 1, &entry)) {
++				return false;
++			}
++			const auto bytes = std::min(end, entry.vaddr + entry.size) - current;
++			if (!RangeOk(entry.backing_offset + current - entry.vaddr, bytes)) {
++				return false;
++			}
++			current += bytes;
++		}
++		return true;
++	}
++
+ 	bool MapExistingPlaceholderFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
+ 	                                 VirtualMemory::Mode mode,
+ 	                                 FailureReason*      failure_reason = nullptr) {
+@@ -694,6 +718,10 @@ public:
+ 		return m_backing->TryReadBacking(vaddr, data, size);
+ 	}
+ 
++	bool HasDirectBacking(uint64_t vaddr, uint64_t size) {
++		return m_backing->HasDirectBacking(vaddr, size);
++	}
++
+ 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
+ 
+ 	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {

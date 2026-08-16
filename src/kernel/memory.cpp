@@ -867,6 +867,11 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
+bool HasDirectBacking(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->HasDirectBacking(vaddr, size);
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 

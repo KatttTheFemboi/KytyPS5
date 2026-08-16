@@ -188,6 +188,30 @@ public:
 		    });
 	}
 
+	// Check whether the entire [vaddr, vaddr+size) range has direct (CPU-accessible) physical
+	// backing, without transferring any data. Returns false if any sub-range is unmapped or its
+	// backing_offset falls outside the allocated backing store.
+	bool HasDirectBacking(uint64_t vaddr, uint64_t size) {
+		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		std::lock_guard lock(m_mutex);
+		const auto      end     = vaddr + size;
+		auto            current = vaddr;
+		while (current < end) {
+			MapEntry entry {};
+			if (!FindContainingUnlocked(current, 1, &entry)) {
+				return false;
+			}
+			const auto bytes = std::min(end, entry.vaddr + entry.size) - current;
+			if (!RangeOk(entry.backing_offset + current - entry.vaddr, bytes)) {
+				return false;
+			}
+			current += bytes;
+		}
+		return true;
+	}
+
 	bool MapExistingPlaceholderFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                                 VirtualMemory::Mode mode,
 	                                 FailureReason*      failure_reason = nullptr) {
@@ -692,6 +716,10 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	bool HasDirectBacking(uint64_t vaddr, uint64_t size) {
+		return m_backing->HasDirectBacking(vaddr, size);
 	}
 
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }

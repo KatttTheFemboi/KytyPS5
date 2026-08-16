@@ -734,23 +734,42 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		    src_memory ? m_texture_cache.QueryRegion(src_vaddr, size) : TextureCache::RegionInfo {};
 		const auto dst_region =
 		    dst_memory ? m_texture_cache.QueryRegion(dst_vaddr, size) : TextureCache::RegionInfo {};
+		// CPU fast-path: both buffers are clean on the GPU side and the source has a direct
+		// CPU-accessible backing. This avoids allocating Vulkan buffers and scheduling a GPU
+		// copy command for what is essentially a plain memcpy visible only to the CPU.
+		// We gate on HasDirectBacking so that GPU-only source memory (e.g. garlic/onion
+		// allocations with no CPU mapping) falls through to the GPU buffer path below instead
+		// of crashing.
 		if (src_memory && dst_memory && !HasGpuDirtyBytes(src_vaddr, size) &&
 		    !HasGpuDirtyBytes(dst_vaddr, size) && !src_region.gpu_image_bytes &&
-		    !dst_region.gpu_image_bytes) {
+		    !dst_region.gpu_image_bytes &&
+		    Libs::LibKernel::Memory::HasDirectBacking(src_vaddr, size)) {
 			if (dst_region.image_bytes) {
 				m_texture_cache.InvalidateMemory(dst_vaddr, size);
 			}
 			std::array<uint8_t, 64 * 1024> bytes;
+			bool fast_path_ok = true;
 			for (uint64_t offset = 0; offset < size;) {
 				const auto chunk = std::min<uint64_t>(size - offset, bytes.size());
 				if (!Libs::LibKernel::Memory::TryReadBacking(src_vaddr + offset, bytes.data(),
 				                                             chunk)) {
-					EXIT("BufferCache: host DMA source has no direct backing\n");
+					// HasDirectBacking passed but TryReadBacking failed — this can only
+					// happen as a race (memory unmapped between the two calls). Log and
+					// fall through to the GPU buffer path rather than returning a
+					// partial result.
+					LOGF("BufferCache: DMA source backing vanished mid-copy at "
+					     "0x%016" PRIx64 "+0x%016" PRIx64 ", falling back to GPU path\n",
+					     src_vaddr, offset);
+					fast_path_ok = false;
+					break;
 				}
 				WriteHostMemory(dst_vaddr + offset, std::span {bytes}.first(chunk));
 				offset += chunk;
 			}
-			return;
+			if (fast_path_ok) {
+				return;
+			}
+			// Fall through to GPU buffer path below.
 		}
 	}
 
